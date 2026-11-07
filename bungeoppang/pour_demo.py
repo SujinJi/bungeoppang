@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""붕어빵 가게 데모 - RViz2 + MoveIt 2 + pymoveit2, 두산 m1013
+"""붕어빵 가게 데모 - RViz2 + MoveIt 2 + pymoveit2, 두산 로봇 (모델은 ROBOT_MODEL, 배치는 layout.py)
 손님 도착 → 90도 인사 → 주문 듣기(종류·개수) → 알아들으면 3초 끄덕 / 못 알아들으면 도리도리 후 재질문
-→ 3개씩 나눠서 굽기 → 90도 인사 → 다음 손님
-한 판: 1차 반죽 → 속재료(팥=빨간 통, 슈크림=노란 통, 아래→위) → 2차 반죽 → 뚜껑 닫기/굽기/열기 → 접시로
+→ 틀 개수(MOLD_COUNT)씩 나눠서 굽기 → 90도 인사 → 다음 손님
+한 판: 1차 반죽 → 속재료(팥=빨간 통, 슈크림=노란 통, 아래→위) → 2차 반죽
+      → 철판 뚜껑 한 번에 닫기(180도) → 회전 손잡이로 180도 뒤집기 → 굽기 → 되돌리기 → 열기 → 접시로
 
 이동 원칙
 - 물건을 들고 있을 때: 위로 → 수평 → 아래로, 직선 이동만
@@ -19,189 +20,18 @@ import rclpy
 from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
-from builtin_interfaces.msg import Duration
 from std_msgs.msg import String, ColorRGBA
-from moveit_msgs.msg import PlanningScene, ObjectColor, LinkPadding
-from moveit_msgs.srv import GetStateValidity
+from moveit_msgs.msg import (PlanningScene, ObjectColor, LinkPadding, PlanningSceneComponents,
+                             AttachedCollisionObject, CollisionObject)
+from moveit_msgs.srv import GetStateValidity, GetPlanningScene, GetPositionIK, ApplyPlanningScene
+from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from visualization_msgs.msg import Marker, MarkerArray
 from pymoveit2 import MoveIt2
-from moveit_msgs.srv import GetPlanningScene
-from moveit_msgs.msg import PlanningSceneComponents
 
-# ---------------- 로봇 설정 (두산 m1013) ----------------
-JOINT_NAMES = [f"joint_{i}" for i in range(1, 7)]
-BASE_LINK = "base_link"
-EE_LINK = "link_6"
-GROUP = "manipulator"
-HOME = [0.0, 0.0, math.pi / 2, 0.0, math.pi / 2, 0.0]
-WRAP_JOINTS = (0, 3, 5)
-YAW_OFFSET = 180.0
-
-TIME_SCALE = 0.1           # 대기 시간 배율: 테스트 0.1, 실제 1.0
-CUSTOMER_DIR = 90.0        # 손님이 서 있는 방향 (로봇 기준, 도). 0 = 정면, -90 = 오른쪽
-ORDER_WAIT = 25.0          # 주문 답을 기다리는 시간 (초)
-ORDER_TRIES = 3            # 주문을 물어보는 최대 횟수
-
-# ---------------- 작업 파라미터 (실물 튜닝 대상) ----------------
-P = {
-    "vel": 0.2,
-    "joint_vmax": 2.0,
-    "lin_speed": 0.10,
-    "ang_speed": 20.0,
-    "path_step": 0.01,
-    "path_deg": 2.0,
-    "max_jump_deg": 25.0,
-    "safety_pad": 0.02,      # 안전 거리: 팔(link_3~5)을 이만큼 두껍게 보고 충돌 검사 (m)
-    "check_deg": 3.0,        # 경로를 몇 도 간격으로 충돌 검사할지
-    "tcp": 0.15,
-    "approach": 0.08,
-    # 인사 / 반응
-    "bow_shoulder": 45.0,
-    "bow_elbow": 45.0,
-    "bow_hold": 1.5,
-    "yes_s": 3.0,
-    "yes_deg": 20.0,
-    "no_deg": 15.0,
-    # 주전자
-    "kettle_lift": 0.20,
-    "pour_point": 2 / 3,
-    "pour_clear": 0.10,
-    "pour_tilt": 30.0,
-    "pour1_hold": 3.0,
-    "pour2_hold": 1.0,
-    "pour_hop": 0.08,
-    "pour2_lift": 0.30,
-    # 소스통
-    "sauce_lift": 0.30,
-    "flip_clear": 0.10,
-    "nozzle_gap": 0.005,
-    "dispense_front": 0.04,
-    "dispense_back": 0.05,
-    "dispense_speed": 0.03,
-    "dispense_hop": 0.08,
-    # 굽기
-    "lid_angle": 90.0,
-    "lid_step": 5.0,
-    "flip_step": 10.0,       # 틀을 몇 도씩 돌릴지
-    "bake_s": 180.0,
-    "bake_front_s": 90.0,    # 뚜껑 닫고 윗면 굽기 (0이면 닫자마자 뒤집기)
-    "bake_back_s": 90.0,     # 앞뒤로 뒤집어서 아랫면 굽기
-    "open_wait": 10.0,
-}
-
-GRIP_OPEN = 0.10
-GRIP_KETTLE = 0.02
-GRIP_SAUCE = 0.07
-GRIP_SQUEEZE = 0.055
-GRIP_LID = 0.06
-GRIP_FISH = 0.06
-
-# ---------------- 장면 배치 (base_link 기준, m) ----------------
-TZ = 0.0
-GAP = 0.002
-WALL = 0.01
-TABLE_SIZE = [1.60, 1.60, 0.04]
-TABLE_POS = [0.55, 0.0, TZ - 0.02 - GAP]
-
-MACHINE_SIZE = [0.30, 0.50, 0.02]          # 틀이 앞뒤로 넘어갈 공간을 위해 얇게
-MACHINE_POS = [0.80, 0.0, TZ + 0.01]
-MOLD_NAMES = ["왼쪽", "중간", "오른쪽"]
-MOLD_PITCH = 0.14
-MOLD_YS = [MOLD_PITCH, 0.0, -MOLD_PITCH]
-MOLD_L, MOLD_W, MOLD_D = 0.20, 0.12, 0.06
-MOLD_X0, MOLD_X1 = 0.70, 0.90
-MOLD_XC = (MOLD_X0 + MOLD_X1) / 2
-MOLD_BASE = TZ + 0.10
-MOLD_TOP = MOLD_BASE + MOLD_D
-POUR_X = MOLD_X0 + MOLD_L * P["pour_point"]
-
-HINGE_X, HINGE_Z = MOLD_X1 + 0.005, MOLD_TOP + 0.005
-LID_LEN, LID_T = MOLD_L, 0.02
-LID_HANDLE = [LID_T + 0.015, LID_LEN - 0.02]
-
-# 틀 뒤집기: 닫힌 틀(틀+뚜껑)을 앞쪽 손잡이를 잡고 길이 방향 축으로 180도 회전
-AXIS_Z = (MOLD_BASE + HINGE_Z + LID_T) / 2   # 회전축 높이 (닫힌 틀의 가운데)
-AXIS_X = (MOLD_X0 + HINGE_X) / 2             # 회전축 앞뒤 위치 (닫힌 틀의 가운데) - 가로(y) 방향 축
-CRANK = [AXIS_X, MACHINE_SIZE[1] / 2 + 0.025, AXIS_Z]  # 기계 왼쪽 옆면 회전 손잡이 (톱니로 틀 3개 연결)
-CRANK_SIZE = [0.03, 0.03, 0.03]
-CRANK_YAW = -90.0                                       # 그리퍼가 기계 쪽(-y)을 향하게
-FLIP_ROLL0 = 90.0
-FLIP_HX = MOLD_X0 - 0.02                      # 틀마다 앞쪽 뒤집기 손잡이 위치 (회전축 높이)
-FLIP_SIZE = [0.04, 0.03, 0.03]
-FLIP_HZ = MOLD_BASE + 0.005                   # 손잡이 높이: 틀 앞쪽 아래 (주전자 바닥과 2cm 여유)
-GRIP_FLIP = 0.03
-
-KETTLE_R, KETTLE_H = 0.07, 0.16
-SPOUT_LEN = 0.14
-KX, KY = 0.50, 0.35
-KZ = TZ + GAP + KETTLE_H / 2
-KETTLE_GRIP = [KX, KY, TZ + GAP + KETTLE_H + 0.05]
-SPOUT_TIP = [KETTLE_R + SPOUT_LEN, (KZ + 0.04) - KETTLE_GRIP[2]]
-
-# 소스통 2개: 팥 = 빨간 통 (로봇 가까운 쪽), 슈크림 = 노란 통 (먼 쪽)
-SAUCES = {"팥": [0.45, -0.50], "슈크림": [0.66, -0.70]}   # 팔이 다른 소스통 위로 지나가지 않는 자리
-SAUCE_IDS = {"팥": "sauce_red", "슈크림": "sauce_cream"}
-FILL_COLORS = {"팥": (0.55, 0.12, 0.08), "슈크림": (1.0, 0.85, 0.3)}
-FILL_LABELS = {"팥": "RED BEAN", "슈크림": "CUSTARD"}
-SAUCE_R, SAUCE_H, NOZZLE_H = 0.035, 0.20, 0.04
-NOZZLE_TIP = SAUCE_H / 2 + NOZZLE_H
-SIDE = -90.0
-SAUCE_YAW = 60.0
-
-# 접시: 붕어빵 6개 자리 (2줄 × 3칸)
-PLATE_XY, PLATE_R = [0.30, 0.60], 0.17   # 왼쪽 (주전자 뒤쪽)
-FISH_SIZE = [0.14, 0.06, 0.025]
-PLATE_SPOTS = [(dx, dy) for dx in (0.075, -0.075) for dy in (0.07, 0.0, -0.07)]
-MAX_ORDER = len(PLATE_SPOTS)
-
-# 안전 이동
-SAFE_Z = 0.55                                  # 바로 가면 위험할 때 올라갈 기본 높이 (m)
-TRANSIT_ZS = (0.55, 0.45, 0.38)               # 높은 것부터 시도 (멀리 있는 목표는 너무 높으면 팔이 안 닿음)
-PAD_LINKS = ["link_3", "link_4", "link_5"]   # 안전 거리를 적용할 팔 부분
-
-KETTLE_PARTS = ["kettle", "kettle_handle", "kettle_post1", "kettle_post2", "kettle_spout"]
-
-
-def sauce_grip(kind):
-    x, y = SAUCES[kind]
-    return [x, y, TZ + GAP + SAUCE_H / 2]
-
-
-def sauce_parts(kind):
-    return [SAUCE_IDS[kind], SAUCE_IDS[kind] + "_nozzle"]
-
-
-def gdir(pitch):
-    a = math.radians(pitch)
-    return [-math.sin(a), 0.0, -math.cos(a)]
-
-
-def qmul(a, b):
-    ax, ay, az, aw = a
-    bx, by, bz, bw = b
-    return [aw * bx + ax * bw + ay * bz - az * by,
-            aw * by - ax * bz + ay * bw + az * bx,
-            aw * bz + ax * by - ay * bx + az * bw,
-            aw * bw - ax * bx - ay * by - az * bz]
-
-
-def add(v, w, s=1.0):
-    return [v[i] + s * w[i] for i in range(3)]
-
-
-def up(v, dz):
-    return [v[0], v[1], v[2] + dz]
-
-
-def lerp(a, b, r):
-    (t0, p0, r0), (t1, p1, r1) = a, b
-    return (add(t0, [t1[i] - t0[i] for i in range(3)], r), p0 + (p1 - p0) * r, r0 + (r1 - r0) * r)
-
-
-def to_duration(t):
-    sec = int(t)
-    return Duration(sec=sec, nanosec=int((t - sec) * 1e9))
+from .geom import gdir, qmul, add, up, lerp, to_duration
+from .layout import *  # noqa: F401,F403  로봇 설정 · 파라미터 · 배치 상수 (모델별)
+from .layout import MODEL
 
 
 class MotionError(RuntimeError):
@@ -235,6 +65,9 @@ class Demo:
                                             callback_group=ReentrantCallbackGroup())
         self.added = {}   # 보낸 물체 기록 (빠진 것 다시 보내기용)
         self.valid_cli = node.create_client(GetStateValidity, "/check_state_validity",
+                                            callback_group=ReentrantCallbackGroup())
+        self.ik_cli = node.create_client(GetPositionIK, "/compute_ik", callback_group=ReentrantCallbackGroup())
+        self.apply_cli = node.create_client(ApplyPlanningScene, "/apply_planning_scene",
                                             callback_group=ReentrantCallbackGroup())
         self.contacts = []
         self.listen_pub = node.create_publisher(String, "/bungeoppang/listen", 10)
@@ -337,7 +170,7 @@ class Demo:
             arr.markers.append(mk(10 + k, "sauce_labels", BASE_LINK, Marker.CYLINDER, (x, y, TZ + 0.003),
                                   (0.11, 0.11, 0.004), FILL_COLORS[kind]))
             arr.markers.append(mk(20 + k, "sauce_labels", BASE_LINK, Marker.TEXT_VIEW_FACING,
-                                  (x, y, TZ + SAUCE_H + NOZZLE_H + 0.06), (0.0, 0.0, 0.04),
+                                  (x, y, SAUCE_Z0 + SAUCE_H + NOZZLE_H + 0.06), (0.0, 0.0, 0.04),
                                   FILL_COLORS[kind], FILL_LABELS[kind]))
         self.marker_pub.publish(arr)
 
@@ -380,11 +213,33 @@ class Demo:
         quat = qmul(qy, qmul(qp, [0.0, 0.0, math.sin(r / 2), math.cos(r / 2)]))
         return add(tcp, self.dirvec(pitch), -P["tcp"]), quat
 
+    def compute_ik(self, pos, quat, seed):
+        """MoveIt IK (충돌 검사 포함). pymoveit2는 시간 제한을 못 줘서 직접 요청함
+        (E0509 기본 15ms로는 멀리 뻗는 자세를 못 찾음 → P["ik_timeout"])"""
+        req = GetPositionIK.Request()
+        ik = req.ik_request
+        ik.group_name = GROUP
+        ik.ik_link_name = EE_LINK
+        ik.avoid_collisions = True
+        ik.robot_state.joint_state = JointState(name=list(JOINT_NAMES), position=[float(v) for v in seed])
+        ik.pose_stamped.header.frame_id = BASE_LINK
+        p = ik.pose_stamped.pose
+        p.position.x, p.position.y, p.position.z = (float(v) for v in pos)
+        p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w = (float(v) for v in quat)
+        ik.timeout = to_duration(P["ik_timeout"])
+        fut = self.ik_cli.call_async(req)
+        t0 = time.time()
+        while not fut.done() and time.time() - t0 < 2.0:
+            time.sleep(0.002)
+        if not fut.done() or fut.result() is None or fut.result().error_code.val != 1:
+            return None
+        return fut.result().solution.joint_state
+
     def ik_near(self, pos, quat, seed):
         best, best_d = None, 1e9
-        seeds = [seed] + [[v + random.uniform(-0.15, 0.15) for v in seed] for _ in range(6)]
+        seeds = [seed] + [[v + random.uniform(-0.2, 0.2) for v in seed] for _ in range(6)]
         for sd in seeds:
-            js = self.m.compute_ik(position=pos, quat_xyzw=quat, start_joint_state=sd)
+            js = self.compute_ik(pos, quat, sd)
             if js is None:
                 continue
             q = [js.position[js.name.index(n)] for n in JOINT_NAMES]
@@ -407,21 +262,31 @@ class Demo:
                 [0.0, 0.0, d90, -d90, d90, 0.0],
                 [0.0, 0.0, d90, d90, -d90, 0.0],
                 [0.0, 0.0, d90, -d90, -d90, 0.0]]
+        j1 = math.atan2(pos[1], pos[0])           # 목표 쪽으로 돌린 시작점 (멀리 뻗는 자세용)
+        base += [[j1, 0.0, d90, 0.0, d90, 0.0], [j1, 0.3, 1.2, 0.0, 1.6, 0.0], [j1, -0.5, 2.0, 0.0, 1.2, 0.0]]
         seeds = base + [[v + random.uniform(-0.6, 0.6) for v in b] for b in base for _ in range(3)]
-        for sd in seeds:
-            js = self.m.compute_ik(position=pos, quat_xyzw=quat, start_joint_state=sd)
-            if js is None:
-                continue
-            q = self.center([js.position[js.name.index(n)] for n in JOINT_NAMES])
+        def score(q):
             d = sum((a - b) ** 2 for a, b in zip(q, HOME))
             if (q[2] > 0) != (HOME[2] > 0):
-                d += 20.0
+                d += 50.0
             if abs(q[5]) > math.radians(120):
                 d += 5.0
             if j4_center and abs(q[3]) > math.radians(120):
-                d += 20.0
-            if d < best_d:
-                best, best_d = q, d
+                d += 50.0
+            return d
+
+        for sd in seeds:
+            js = self.compute_ik(pos, quat, sd)
+            if js is None:
+                continue
+            q = self.center([js.position[js.name.index(n)] for n in JOINT_NAMES])
+            # 같은 손 자세를 내는 반대 손목 해 (joint_4 +180, joint_5 부호 반대, joint_6 +180)
+            # KDL이 시작점에 따라 손목 뒤집힌 해만 주는 경우가 있음 → joint_6이 ±180 경계에 붙어 버림
+            qf = self.center([q[0], q[1], q[2], q[3] + math.pi, -q[4], q[5] + math.pi])
+            for cand, need_check in ((q, False), (qf, True)):
+                d = score(cand)
+                if d < best_d and (not need_check or self.state_ok(cand)):
+                    best, best_d = cand, d
         return best
 
     # ---------- 충돌 검사 ----------
@@ -576,6 +441,24 @@ class Demo:
 
     def tilt(self, tcp, deg):
         self.straight((list(tcp), deg, self.cur[2]))
+
+    def turn_yaw(self, yaw1, step=5.0):
+        """손 위치는 그대로, 수평 방향(yaw)만 조금씩 돌리기 (물건을 높이 든 채로)"""
+        y0 = self.cur_yaw
+        n = max(1, math.ceil(abs(yaw1 - y0) / step))
+        for k in range(1, n + 1):
+            self.yaw = y0 + (yaw1 - y0) * k / n
+            self.straight((list(self.cur[0]), self.cur[1], self.cur[2]))
+        self.yaw = yaw1
+
+    def tilt_tip(self, tip, a0, a1, step=5.0):
+        """주둥이 끝(tip)을 제자리에 두고 a0 → a1도 기울이기 (손잡이 쪽이 들리며 기울어짐)"""
+        dx, dz = SPOUT_TIP
+        n = max(1, math.ceil(abs(a1 - a0) / step))
+        for k in range(1, n + 1):
+            t = math.radians(a0 + (a1 - a0) * k / n)
+            off = [dx * math.cos(t) + dz * math.sin(t), 0.0, -dx * math.sin(t) + dz * math.cos(t)]
+            self.straight((add(tip, off, -1.0), a0 + (a1 - a0) * k / n, self.cur[2]))
 
     def go(self, tcp, pitch=0.0, roll=0.0, j4_center=False):
         """빈손 이동: 바로 가는 길에 충돌이 있으면 → 안전 높이로 올라가서 → 목표 위로 → 수직으로 내려감.
@@ -740,6 +623,7 @@ class Demo:
             self.color(sauce_parts(kind), FILL_COLORS[kind])
         self.color(KETTLE_PARTS, (0.75, 0.75, 0.8))
         self.color(["plate"], (0.95, 0.95, 0.95))
+        self.color(["steel_bottom", "steel_top", "lid_handle", "crank"], (0.45, 0.45, 0.5))
 
     def open_box(self, name, xy, size, z0):
         sx, sy, sz = size
@@ -750,81 +634,73 @@ class Demo:
         self.box(f"{name}_wy0", [sx, WALL, sz], [x, y - sy / 2 + WALL / 2, z0 + sz / 2])
         self.box(f"{name}_wy1", [sx, WALL, sz], [x, y + sy / 2 - WALL / 2, z0 + sz / 2])
 
-    def hinge_point(self, i, phi, lx, lz):
+    def hinge_point(self, phi, lx, lz, y):
+        """뚜껑 좌표 (lx, lz)를 경첩 기준 phi도 돌린 위치"""
         a = math.radians(phi)
-        return [HINGE_X + lx * math.cos(a) - lz * math.sin(a), MOLD_YS[i],
+        return [HINGE_X + lx * math.cos(a) - lz * math.sin(a), y,
                 HINGE_Z + lx * math.sin(a) + lz * math.cos(a)]
 
-    def handle_point(self, i, phi):
-        return self.hinge_point(i, phi, *LID_HANDLE)
+    def handle_point(self, phi):
+        """위 철판 손잡이 위치 (철판 하나라 틀 개수와 상관없이 하나)"""
+        return self.hinge_point(phi, LID_HANDLE[0], LID_HANDLE[1], STEEL_YC)
 
-    def set_lid(self, i, phi):
+    def lid_parts(self, phi):
+        """뚜껑 쪽 물체들 (틀마다 뚜껑 + 위 철판 + 손잡이)을 phi도로 놓은 모습: (id, 크기, 중심, 자세)"""
         a = math.radians(-phi)
-        quat = (0.0, math.sin(a / 2), 0.0, math.cos(a / 2))
-        self.box(f"lid{i}", [LID_T, MOLD_W, LID_LEN], self.hinge_point(i, phi, LID_T / 2, LID_LEN / 2), quat)
-        self.box(f"lid{i}_handle", [0.03, 0.06, 0.03], self.handle_point(i, phi), quat)
+        q = (0.0, math.sin(a / 2), 0.0, math.cos(a / 2))
+        parts = [(f"lid{i}", [LID_T, MOLD_W, LID_LEN], self.hinge_point(phi, LID_T / 2, LID_LEN / 2, y), q)
+                 for i, y in enumerate(MOLD_YS)]
+        parts.append(("steel_top", [STEEL_T, STEEL_W, LID_LEN],             # 뚜껑 바깥면 위 철판
+                      self.hinge_point(phi, LID_T + STEEL_T / 2, LID_LEN / 2, STEEL_YC), q))
+        parts.append(("lid_handle", LID_HANDLE_SIZE, self.handle_point(phi), q))
+        return parts
 
-    def closed_parts(self, i):
-        """닫힌 틀 i를 이루는 물체들 (id, 크기, 중심, 자세) - 뒤집기 전 기준"""
-        y = MOLD_YS[i]
+    def base_parts(self):
+        """아래 쪽 물체들 (틀마다 바닥·벽 + 아래 철판), 뒤집기 전 자리"""
+        q0 = (0.0, 0.0, 0.0, 1.0)
         sx, sy, sz = MOLD_L, MOLD_W, MOLD_D
         x, z0 = MOLD_XC, MOLD_BASE
-        q0 = (0.0, 0.0, 0.0, 1.0)
-        a = math.radians(-90.0)
-        ql = (0.0, math.sin(a / 2), 0.0, math.cos(a / 2))
-        return [
-            (f"mold{i}_bottom", [sx, sy, WALL], [x, y, z0 + WALL / 2], q0),
-            (f"mold{i}_wx0", [WALL, sy, sz], [x - sx / 2 + WALL / 2, y, z0 + sz / 2], q0),
-            (f"mold{i}_wx1", [WALL, sy, sz], [x + sx / 2 - WALL / 2, y, z0 + sz / 2], q0),
-            (f"mold{i}_wy0", [sx, WALL, sz], [x, y - sy / 2 + WALL / 2, z0 + sz / 2], q0),
-            (f"mold{i}_wy1", [sx, WALL, sz], [x, y + sy / 2 - WALL / 2, z0 + sz / 2], q0),
-            (f"lid{i}", [LID_T, MOLD_W, LID_LEN], self.hinge_point(i, 90.0, LID_T / 2, LID_LEN / 2), ql),
-            (f"lid{i}_handle", [0.03, 0.06, 0.03], self.handle_point(i, 90.0), ql),
-            (f"mold{i}_flip", FLIP_SIZE, [FLIP_HX, y, FLIP_HZ], q0),
-        ]
+        parts = [("steel_bottom", [MOLD_L, STEEL_W, STEEL_T], [x, STEEL_YC, z0 - STEEL_T / 2], q0)]
+        for i, y in enumerate(MOLD_YS):
+            parts += [
+                (f"mold{i}_bottom", [sx, sy, WALL], [x, y, z0 + WALL / 2], q0),
+                (f"mold{i}_wx0", [WALL, sy, sz], [x - sx / 2 + WALL / 2, y, z0 + sz / 2], q0),
+                (f"mold{i}_wx1", [WALL, sy, sz], [x + sx / 2 - WALL / 2, y, z0 + sz / 2], q0),
+                (f"mold{i}_wy0", [sx, WALL, sz], [x, y - sy / 2 + WALL / 2, z0 + sz / 2], q0),
+                (f"mold{i}_wy1", [sx, WALL, sz], [x, y + sy / 2 - WALL / 2, z0 + sz / 2], q0),
+            ]
+        return parts
 
-    def set_flip(self, i, theta):
-        """닫힌 틀 i를 가로 회전축(y 방향) 기준으로 앞뒤로 theta도 넘긴 모습으로 다시 그림"""
+    def put(self, parts):
+        for pid, size, ctr, q in parts:
+            self.box(pid, size, ctr, q)
+
+    def set_lid(self, phi):
+        """뚜껑(위 철판 전체)을 phi도로 다시 그림"""
+        for pid, size, ctr, q in self.lid_parts(phi):
+            self.m.add_collision_box(id=pid, size=size, position=ctr, quat_xyzw=list(q))
+            self.added[pid] = ("box", size, ctr, q)
+            time.sleep(0.01)
+
+    def closed_parts(self):
+        """닫힌 철판 전체 (뒤집기 전 기준)"""
+        return self.base_parts() + self.lid_parts(LID_CLOSED)
+
+    def set_flip(self, theta):
+        """닫힌 철판 전체를 가로 회전축(y 방향) 기준으로 앞뒤로 theta도 넘긴 모습으로 다시 그림"""
         t = math.radians(theta)
         c, s = math.cos(t), math.sin(t)
         qr = [0.0, math.sin(t / 2), 0.0, math.cos(t / 2)]
-        for pid, size, ctr, q in self.closed_parts(i):
+        for pid, size, ctr, q in self.closed_parts():
             dx, dz = ctr[0] - AXIS_X, ctr[2] - AXIS_Z
             new = [AXIS_X + dx * c + dz * s, ctr[1], AXIS_Z - dx * s + dz * c]
             self.m.add_collision_box(id=pid, size=size, position=new, quat_xyzw=qmul(qr, list(q)))
             time.sleep(0.01)
 
-    def flip_mold(self, i, back):
-        """틀 i의 앞쪽 손잡이를 위에서 잡고, 회전축을 중심으로 위로 원을 그리며 뒤쪽까지 넘김 → 앞뒤로 180도.
-        back=True면 뒤로 넘어간 손잡이를 잡고 반대로 되돌림 (그리퍼는 계속 아래를 향함)"""
-        y = MOLD_YS[i]
-        dx, dz = FLIP_HX - AXIS_X, FLIP_HZ - AXIS_Z
-
-        def handle_at(phi):           # phi: 0 = 앞(원래 자리), 180 = 뒤(뒤집힌 자리)
-            a = math.radians(phi)
-            return [AXIS_X + dx * math.cos(a) + dz * math.sin(a), y,
-                    AXIS_Z - dx * math.sin(a) + dz * math.cos(a)]
-
-        p0, p1 = (180.0, 0.0) if back else (0.0, 180.0)
-        self.log(f"   ▶ {MOLD_NAMES[i]} 틀 {'윗면으로 되돌리기' if back else '앞뒤로 뒤집기'}")
-        g = handle_at(p0)
-        self.go(up(g, P["approach"]))
-        self.lin(g)
-        self.gripper(GRIP_FLIP, "CLOSE (뒤집기 손잡이 조이기)")
-        n = max(1, int(round(180.0 / P["flip_step"])))
-        for k in range(1, n + 1):
-            phi = p0 + (p1 - p0) * k / n
-            self.straight((handle_at(phi), 0.0, 0.0))
-            self.set_flip(i, phi)
-            if k % 6 == 0 or k == n:
-                self.log(f"      {abs(phi - p0):.0f}도")
-        self.gripper(GRIP_OPEN, "OPEN (풀기)")
-        self.lin(up(handle_at(p1), P["approach"]))
-
     def flip_all(self, back):
-        """기계 왼쪽 옆 회전 손잡이를 잡고 손목 끝만 180도 돌림 → 톱니로 연결된 틀 3개가 함께 뒤집힘
+        """기계 왼쪽 옆 회전 손잡이를 잡고 손목 끝만 180도 돌림 → 닫힌 철판(틀 전부)이 함께 뒤집힘
         (되돌릴 땐 반대 방향 180도)"""
-        self.log(f"   ▶ 회전 손잡이로 틀 3개 앞뒤로 {'되돌리기 (윗면 위로)' if back else '뒤집기 (아랫면 위로)'}")
+        self.log(f"   ▶ 회전 손잡이로 철판(틀 {len(MOLD_YS)}개) {'되돌리기' if back else '180도 뒤집기'}")
         self.yaw = CRANK_YAW
         g = list(CRANK)
         pre = add(g, self.dirvec(SIDE), -P["approach"])
@@ -836,8 +712,7 @@ class Demo:
         n = max(1, int(round(180.0 / P["flip_step"])))
         for k in range(1, n + 1):
             self.straight((g, SIDE, FLIP_ROLL0 + d * k / n))
-            for i in range(len(MOLD_YS)):
-                self.set_flip(i, start - d * k / n)
+            self.set_flip(start - d * k / n)
             if k % 6 == 0 or k == n:
                 self.log(f"      {abs(d * k / n):.0f}도")
         self.gripper(GRIP_OPEN, "OPEN (풀기)")
@@ -865,6 +740,54 @@ class Demo:
         return {o.id for o in sc.world.collision_objects} | \
                {a.object.id for a in sc.robot_state.attached_collision_objects}
 
+    def scene_ids(self):
+        """MoveIt 장면의 (바닥에 있는 물체 이름, 로봇에 붙어 있는 물체 이름)"""
+        req = GetPlanningScene.Request()
+        req.components.components = (PlanningSceneComponents.WORLD_OBJECT_NAMES |
+                                     PlanningSceneComponents.ROBOT_STATE_ATTACHED_OBJECTS)
+        fut = self.scene_cli.call_async(req)
+        t0 = time.time()
+        while not fut.done() and time.time() - t0 < 3.0:
+            time.sleep(0.02)
+        if not fut.done() or fut.result() is None:
+            return set(), set()
+        sc = fut.result().scene
+        return ({o.id for o in sc.world.collision_objects},
+                {a.object.id for a in sc.robot_state.attached_collision_objects})
+
+    def apply_scene(self, ps):
+        """장면 변경을 서비스로 확실하게 적용 (토픽은 막 켜진 직후 메시지가 사라질 수 있음)"""
+        self.apply_cli.wait_for_service(timeout_sec=5.0)
+        fut = self.apply_cli.call_async(ApplyPlanningScene.Request(scene=ps))
+        t0 = time.time()
+        while not fut.done() and time.time() - t0 < 5.0:
+            time.sleep(0.02)
+        return fut.done() and fut.result() is not None and fut.result().success
+
+    def clear_scene(self):
+        """예전 실행에서 남은 물체 지우기 (실패하면서 그리퍼에 붙은 채 남은 것 포함)"""
+        world, attached = self.scene_ids()
+        if attached:                                   # 1) 로봇에서 떼기 → 바닥 물체가 됨
+            ps = PlanningScene(is_diff=True)
+            ps.robot_state.is_diff = True
+            for i in attached:
+                ps.robot_state.attached_collision_objects.append(AttachedCollisionObject(
+                    link_name=EE_LINK, object=CollisionObject(id=i, operation=CollisionObject.REMOVE)))
+            self.apply_scene(ps)
+            world, still = self.scene_ids()
+            if still:
+                self.warn(f"그리퍼에서 안 떨어진 물체: {', '.join(sorted(still))}")
+        if world:                                      # 2) 바닥 물체 전부 지우기
+            ps = PlanningScene(is_diff=True)
+            for i in world:
+                co = CollisionObject(id=i, operation=CollisionObject.REMOVE)
+                co.header.frame_id = BASE_LINK
+                ps.world.collision_objects.append(co)
+            self.apply_scene(ps)
+        if world or attached:
+            self.log(f"🧹 남아 있던 물체 {len(world | attached)}개 지움 (붙어 있던 것 {len(attached)}개)")
+        self.added = {}
+
     def ensure_scene(self):
         """보낸 물체가 전부 장면에 들어갔는지 확인하고, 빠진 건 다시 보냄"""
         for _ in range(5):
@@ -888,13 +811,20 @@ class Demo:
 
     def build_scene(self):
         self.box("table", TABLE_SIZE, TABLE_POS)
+        if ROBOT_PLATE:                                                   # 로봇 바닥판 (윗면은 base_link 4mm 아래)
+            top = -0.004                                                  # 작업대 윗면(TZ) ~ top
+            self.box("robot_plate", [ROBOT_PLATE[0], ROBOT_PLATE[1], top - TZ], [0.0, 0.0, (TZ + top) / 2])
         self.box("machine", MACHINE_SIZE, MACHINE_POS)
-        self.box("flip_shaft", [0.008, MACHINE_SIZE[1] + 0.02, 0.008],   # 기계 바닥판 위에 눕힌 봉
-                 [AXIS_X, 0.0, TZ + MACHINE_SIZE[2] + 0.004])
-        for i, y in enumerate(MOLD_YS):
-            self.open_box(f"mold{i}", [MOLD_XC, y], [MOLD_L, MOLD_W, MOLD_D], MOLD_BASE)
-            self.set_lid(i, 0.0)
-            self.box(f"mold{i}_flip", FLIP_SIZE, [FLIP_HX, y, FLIP_HZ])
+        # 받침 기둥 2개: 철판 양쪽 바깥, 바닥판에서 회전축 높이까지 (철판은 기둥 끝 축에 걸려서 앞뒤로 돎)
+        post_h = AXIS_Z - (TZ + MACHINE_SIZE[2])
+        for k, py in enumerate((STEEL_Y1 + 0.012, STEEL_Y0 - 0.012)):
+            self.box(f"mold_post{k}", [0.012, 0.012, post_h], [AXIS_X, py, TZ + MACHINE_SIZE[2] + post_h / 2])
+        # 회전 손잡이: 왼쪽 기둥 → 짧은 축 → 손잡이
+        y0 = STEEL_Y1 + 0.012
+        self.box("crank_shaft", [0.012, CRANK[1] - y0, 0.012], [AXIS_X, (CRANK[1] + y0) / 2, AXIS_Z])
+        self.box("crank", CRANK_SIZE, CRANK)
+        self.put(self.base_parts())
+        self.put(self.lid_parts(LID_OPEN))                                # 처음: 뚜껑 180도 열려 누워 있음
         self.cyl("kettle", KETTLE_H, KETTLE_R, [KX, KY, KZ])
         top = TZ + GAP + KETTLE_H
         self.box("kettle_handle", [0.10, 0.02, 0.02], KETTLE_GRIP)
@@ -904,9 +834,11 @@ class Demo:
         for kind in SAUCES:
             g = sauce_grip(kind)
             sid, nid = sauce_parts(kind)
+            if SAUCE_STAND_H > 0:                                         # 받침대
+                self.box(f"{sid}_stand", [0.09, 0.09, SAUCE_STAND_H], [g[0], g[1], TZ + SAUCE_STAND_H / 2])
             self.cyl(sid, SAUCE_H, SAUCE_R, g)
-            self.cyl(nid, NOZZLE_H, 0.008, [g[0], g[1], TZ + GAP + SAUCE_H + NOZZLE_H / 2])
-        self.cyl("plate", 0.01, PLATE_R, [PLATE_XY[0], PLATE_XY[1], TZ + GAP + 0.005])
+            self.cyl(nid, NOZZLE_H, 0.008, [g[0], g[1], SAUCE_Z0 + SAUCE_H + NOZZLE_H / 2])
+        self.box("plate", PLATE_SIZE, [PLATE_XY[0], PLATE_XY[1], TZ + GAP + PLATE_SIZE[2] / 2])
         time.sleep(1.0)
 
     def clear_plate(self):
@@ -931,9 +863,10 @@ class Demo:
         self.hv(t)
         for k, i in enumerate(molds):
             self.log(f"   ▶ {MOLD_NAMES[i]} 틀")
-            self.tilt(t, P["pour_tilt"])
+            tip = [t[0] + SPOUT_TIP[0], t[1], t[2] + SPOUT_TIP[1]]   # 주둥이 끝 = 틀 2/3 지점 위 pour_clear
+            self.tilt_tip(tip, 0.0, P["pour_tilt"])
             self.wait(hold, "붓기")
-            self.tilt(t, 0.0)
+            self.tilt_tip(tip, P["pour_tilt"], 0.0)
             self.lin(up(t, P["pour_hop"]))
             if k == len(molds) - 1:
                 return
@@ -962,9 +895,9 @@ class Demo:
         color = "빨간" if kind == "팥" else "노란"
 
         self.set_step(f"   [{kind}] {color} 소스통 집기 (옆으로 눕혀 몸통 중간)")
-        self.yaw = SAUCE_YAW
+        self.yaw = SAUCE_GRASP_YAW[kind]
         pre = add(grip, self.dirvec(SIDE), -P["approach"])
-        self.go(pre, SIDE, 0.0)
+        self.go(pre, SIDE, SAUCE_GRASP_ROLL)
         self.lin(grip)
         self.grab(parts, GRIP_SAUCE)
 
@@ -972,8 +905,13 @@ class Demo:
         z_d = MOLD_TOP + P["nozzle_gap"] + NOZZLE_TIP
         x0 = MOLD_X0 + P["dispense_front"]
         x1 = MOLD_X1 - P["dispense_back"]
-        self.lin(up(grip, P["sauce_lift"]))
-        self.hv([x0, MOLD_YS[molds[0]], z_d + P["flip_clear"]])
+        carry = SAUCE_CARRY_Z                                            # 들고 이동하는 높이
+        self.lin([grip[0], grip[1], carry])                              # 들어올리기
+        xt = SAUCE_TURN_X                                                # 손 방향 돌리는 곳: 열린 뚜껑 위
+        self.lin([xt, grip[1], carry])                                   # 먼저 로봇 쪽으로 빠지고 (옆 소스통 위로 안 지나가게)
+        self.lin([xt, MOLD_YS[molds[0]], carry])                         # 잡은 방향 그대로 첫 틀 쪽으로 (수평)
+        self.turn_yaw(SAUCE_YAW)                                         # 거기서 손을 옆으로
+        self.hv([x0, MOLD_YS[molds[0]], z_d + P["flip_clear"]], travel_z=carry)
         self.flip_sauce(down=True)
 
         self.set_step(f"   [{kind}] 속재료 넣기: {names} (각 아래 → 위)")
@@ -993,25 +931,75 @@ class Demo:
         self.lin([c[0], c[1], z_d + P["flip_clear"]])    # 수직으로 올라가서
         self.lin([x0, c[1], z_d + P["flip_clear"]])      # 뚜껑에서 먼 앞쪽으로 수평 이동
         self.flip_sauce(down=False)                       # 거기서 입구를 위로
-        self.hv(grip, travel_z=max(grip[2] + P["sauce_lift"], self.cur[0][2]))
+        self.lin([x0, self.cur[0][1], carry])
+        self.lin([xt, self.cur[0][1], carry])
+        self.turn_yaw(SAUCE_GRASP_YAW[kind])              # 경첩 너머에서 다시 잡을 때 방향으로
+        self.lin([xt, grip[1], carry])                    # 제 줄로 옮긴 뒤
+        self.lin([grip[0], grip[1], carry])
+        self.lin(grip)
         self.release(parts)
         self.color(parts, FILL_COLORS[kind])
         self.lin(pre)
         self.yaw = 0.0
 
-    def move_lid(self, i, phi0, phi1):
+    def lid_pitch(self, phi):
+        """뚜껑 각도별 그리퍼 기울기: 열림(멀리) lid_pitch → 닫힘(가까이) 0도"""
+        return P["lid_pitch"] * (LID_CLOSED - phi) / (LID_CLOSED - LID_OPEN)
+
+    def move_lid(self, phi0, phi1):
+        """위 철판 손잡이를 잡은 채 경첩 중심으로 phi0 → phi1 (뚜껑 전부 한 번에)"""
         n = max(1, int(round(abs(phi1 - phi0) / P["lid_step"])))
         for k in range(1, n + 1):
             phi = phi0 + (phi1 - phi0) * k / n
-            self.straight((self.handle_point(i, phi), 0.0, 0.0))
-            self.set_lid(i, phi)
+            self.straight((self.handle_point(phi), self.lid_pitch(phi), 0.0))
+            self.set_lid(phi)
             if k % 6 == 0 or k == n:
-                self.log(f"      뚜껑 각도 {phi:.0f}도")
+                self.log(f"      뚜껑 {abs(phi - phi0):.0f}도")
 
-    # ---------- 한 판 굽기 (틀 최대 3개) ----------
+    def lid_closed_seed(self):
+        """열린 손잡이에서 닫힌 손잡이까지 이어지는 관절 해를 따라가서, 닫힌 쪽 끝 자세를 돌려줌.
+        열 때 이 해로 잡아야 끝(완전히 누움)까지 이어짐 (다른 해로 잡으면 중간에 끊길 수 있음)"""
+        q = self.ik_pref(*self.flange(self.handle_point(LID_OPEN), self.lid_pitch(LID_OPEN)))
+        if q is None:
+            return None
+        n = max(1, int(round((LID_CLOSED - LID_OPEN) / P["lid_step"])))
+        for k in range(1, n + 1):
+            phi = LID_OPEN + (LID_CLOSED - LID_OPEN) * k / n
+            qn = self.ik_near(*self.flange(self.handle_point(phi), self.lid_pitch(phi)), q)
+            if qn is None or self.jump(q, qn):
+                return None
+            q = qn
+        return q
+
+    def lid(self, close):
+        """철판 뚜껑 한 번에 닫기(열림 → 180도 → 닫힘) / 열기(반대로)"""
+        p0, p1 = (LID_OPEN, LID_CLOSED) if close else (LID_CLOSED, LID_OPEN)
+        g = self.handle_point(p0)
+        above = up(g, P["approach"])
+        q_up = None
+        if not close:                                   # 열기: 끝까지 이어지는 해로 손잡이 위에 가기
+            seed = self.lid_closed_seed()
+            if seed is not None:
+                q_up = self.ik_near(*self.flange(above, self.lid_pitch(p0)), seed)
+            if q_up is not None and not self.path_clear(self.current_joints(), q_up):
+                q_up = None
+            if q_up is None:
+                self.warn(f"[{self.step}] 끝까지 이어지는 열기 자세를 못 찾음 → 보통 방법으로 접근")
+        if q_up is not None:
+            self.joints(q_up, checked=True)
+            self.cur = (above, self.lid_pitch(p0), 0.0)
+            self.cur_yaw = self.yaw
+        else:
+            self.go(above, self.lid_pitch(p0))
+        self.lin(g)
+        self.gripper(GRIP_LID, "CLOSE (철판 손잡이 조이기)")
+        self.move_lid(p0, p1)
+        self.gripper(GRIP_OPEN, "OPEN (풀기)")
+        self.lin(up(self.handle_point(p1), P["approach"]))
+
+    # ---------- 한 판 굽기 (틀 개수만큼) ----------
     def bake_batch(self, fillings, tag):
         molds = list(range(len(fillings)))
-        A = P["lid_angle"]
         self.home()
 
         self.set_step(f"{tag} 1. 주전자 잡고 들어올리기")
@@ -1033,45 +1021,26 @@ class Demo:
         self.set_step(f"{tag} 6. 2차 반죽")
         self.pour_all(P["pour2_hold"], molds)
         high_z = self.pour_tcp(MOLD_YS[molds[-1]])[2] + P["pour2_lift"]
-        self.set_step(f"{tag} 7. 30cm 위로 → 주전자 제자리")
+        self.set_step(f"{tag} 7. {P['pour2_lift'] * 100:.0f}cm 위로 → 주전자 제자리")
         self.place_kettle(high_z)
 
-        self.set_step(f"{tag} 8. 뚜껑 닫기")
-        for i in range(len(MOLD_YS)):          # 빈 틀 뚜껑도 닫고 엶
-            self.log(f"   ▶ {MOLD_NAMES[i]} 뚜껑")
-            g = self.handle_point(i, 0.0)
-            self.go(up(g, P["approach"]))
-            self.lin(g)
-            self.gripper(GRIP_LID, "CLOSE (손잡이 조이기)")
-            self.move_lid(i, 0.0, A)
-            self.gripper(GRIP_OPEN, "OPEN (풀기)")
-            self.lin(up(self.handle_point(i, A), P["approach"]))
-
+        self.set_step(f"{tag} 8. 철판 뚜껑 한 번에 닫기 (180도)")
+        self.lid(close=True)
         if P["bake_front_s"] > 0:
             self.set_step(f"{tag} 9. 윗면 굽기")
             self.wait(P["bake_front_s"], "윗면 굽기")
-        self.set_step(f"{tag} 9-1. 틀을 하나씩 앞뒤로 뒤집기: " + " → ".join(MOLD_NAMES[i] for i in molds))
+        self.set_step(f"{tag} 9-1. 회전 손잡이로 철판 180도 뒤집기")
         self.home()
-        for i in molds:                         # 빈 틀은 안 뒤집음
-            self.flip_mold(i, back=False)
+        self.flip_all(back=False)
         self.home()
-        self.set_step(f"{tag} 9-2. 아랫면 굽기")
-        self.wait(P["bake_back_s"], "아랫면 굽기")
-        self.set_step(f"{tag} 9-3. 하나씩 윗면으로 되돌리기: " + " → ".join(MOLD_NAMES[i] for i in molds))
-        for i in molds:
-            self.flip_mold(i, back=True)
+        self.set_step(f"{tag} 9-2. 뒤집은 채로 굽기")
+        self.wait(P["bake_back_s"], "굽기")
+        self.set_step(f"{tag} 9-3. 회전 손잡이로 철판 180도 되돌리기")
+        self.flip_all(back=True)
         self.home()
 
-        self.set_step(f"{tag} 10. 뚜껑 열기")
-        for i in range(len(MOLD_YS)):          # frame closed -> frame opened
-            self.log(f"   ▶ {MOLD_NAMES[i]} 뚜껑")
-            g = self.handle_point(i, A)
-            self.go(up(g, P["approach"]))
-            self.lin(g)
-            self.gripper(GRIP_LID, "CLOSE (손잡이 조이기)")
-            self.move_lid(i, A, 0.0)
-            self.gripper(GRIP_OPEN, "OPEN (풀기)")
-            self.lin(up(self.handle_point(i, 0.0), P["approach"]))
+        self.set_step(f"{tag} 10. 철판 뚜껑 한 번에 열기 (180도)")
+        self.lid(close=False)
         self.wait(P["open_wait"], "식히기")
 
         self.set_step(f"{tag} 11. 붕어빵 꺼내서 접시에 놓기")
@@ -1086,9 +1055,13 @@ class Demo:
             self.go(up(fish, P["approach"] + MOLD_D))
             self.lin(fish)
             self.grab([fid], GRIP_FISH)
-            dx, dy = PLATE_SPOTS[n]
-            spot = [PLATE_XY[0] + dx, PLATE_XY[1] + dy, TZ + GAP + 0.15 + GAP + FISH_SIZE[2] / 2]
-            self.hv(spot, travel_z=fish[2] + 0.30)
+            dx, dy, lv = PLATE_SPOTS[n]
+            spot = [PLATE_XY[0] + dx, PLATE_XY[1] + dy,
+                    TZ + GAP + PLATE_SIZE[2] + GAP + FISH_SIZE[2] / 2 + lv * (FISH_SIZE[2] + GAP)]
+            tz = fish[2] + P["fish_lift"]
+            if PLATE_VIA:
+                self.hv([PLATE_VIA[0], PLATE_VIA[1], tz])
+            self.hv(spot, travel_z=tz)
             self.release([fid])
             self.color([fid], FILL_COLORS[fillings[i]])
             self.on_plate.append(fid)
@@ -1096,7 +1069,8 @@ class Demo:
         self.home()
 
     def serve(self, fills):
-        batches = [fills[i:i + 3] for i in range(0, len(fills), 3)]
+        n = len(MOLD_YS)
+        batches = [fills[i:i + n] for i in range(0, len(fills), n)]
         for b, chunk in enumerate(batches, 1):
             self.set_step(f"🔥 {b}/{len(batches)}판 굽기 시작: " + ", ".join(chunk))
             self.bake_batch(chunk, f"[{b}판]")
@@ -1105,7 +1079,9 @@ class Demo:
 # repeated 
     def shop(self):
         """가게 운영: 손님 대기 → 90도 인사 → 주문(끄덕/도리도리) → 굽기 → 90도 인사 → 반복"""
+        self.log(f"🤖 로봇 모델 {MODEL} 배치 사용 (속도 vel {P['vel']})")
         self.wait_scene_ready()
+        self.clear_scene()
         self.build_scene()
         self.ensure_scene()
         self.paint_scene()
